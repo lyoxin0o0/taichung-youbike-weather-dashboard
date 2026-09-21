@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import numpy as np
 import pandas as pd
 import plotly.express as px
 import plotly.graph_objects as go
@@ -326,6 +327,145 @@ def page_station(df: pd.DataFrame) -> None:
     st.plotly_chart(fig, width="stretch")
 
 
+def page_nearby(df: pd.DataFrame) -> None:
+    st.title("🧭 周邊替代站")
+    st.write(
+        "選擇一個 YouBike 站點後，尋找直線距離 **500 公尺內**、正在營運且仍有車可借的替代站。"
+    )
+    st.caption("此頁使用所選時間的場站快照；距離是依經緯度計算的直線距離，不是實際步行路線。")
+
+    snapshot_times = sorted(df["抓取時間"].dropna().unique(), reverse=True)
+    selected_time = st.selectbox(
+        "選擇資料時間",
+        snapshot_times,
+        format_func=lambda value: pd.Timestamp(value).strftime("%Y-%m-%d %H:%M"),
+    )
+    snapshot = df[df["抓取時間"].eq(selected_time)].copy()
+    snapshot = snapshot.drop_duplicates("場站代號", keep="last")
+    snapshot["顯示站名"] = (
+        snapshot["場站中文名稱"].astype(str).str.replace("YouBike2.0_", "", regex=False)
+    )
+    station_options = snapshot.sort_values(["場站所屬行政區", "顯示站名"])["顯示站名"].tolist()
+    default_index = next(
+        (index for index, name in enumerate(station_options) if "賴厝國小" in name),
+        0,
+    )
+    selected_name = st.selectbox(
+        "選擇要查詢的站點（可以直接輸入站名搜尋）",
+        station_options,
+        index=default_index,
+    )
+    reference = snapshot[snapshot["顯示站名"].eq(selected_name)].iloc[0]
+
+    lat1 = np.radians(float(reference["緯度"]))
+    lon1 = np.radians(float(reference["經度"]))
+    lat2 = np.radians(snapshot["緯度"].astype(float))
+    lon2 = np.radians(snapshot["經度"].astype(float))
+    dlat = lat2 - lat1
+    dlon = lon2 - lon1
+    haversine_value = (
+        np.sin(dlat / 2) ** 2
+        + np.cos(lat1) * np.cos(lat2) * np.sin(dlon / 2) ** 2
+    )
+    snapshot["距離_公尺"] = 6_371_000 * 2 * np.arcsin(np.sqrt(haversine_value))
+
+    alternatives = snapshot[
+        snapshot["場站代號"].ne(reference["場站代號"])
+        & snapshot["距離_公尺"].gt(0)
+        & snapshot["距離_公尺"].le(500)
+        & snapshot["場站營運狀態"].eq(1)
+        & snapshot["目前可借車輛數"].gt(0)
+    ].copy()
+    alternatives = alternatives.sort_values(["距離_公尺", "目前可借車輛數"], ascending=[True, False])
+
+    reference_available = int(reference["目前可借車輛數"])
+    if reference["場站營運狀態"] != 1:
+        st.error(f"{selected_name} 在這個時間點暫停營運。")
+    elif reference_available == 0:
+        st.error(f"{selected_name} 在這個時間點沒有車可借，請查看下方替代站。")
+    else:
+        st.success(f"{selected_name} 本站目前有 {reference_available} 輛車可借，附近替代站如下。")
+
+    if alternatives.empty:
+        st.warning("這個時間點在 500 公尺內找不到有車可借的其他站點。")
+        nearest_name = "沒有符合站點"
+        nearest_distance = "—"
+        nearest_bikes = "—"
+    else:
+        nearest = alternatives.iloc[0]
+        nearest_name = nearest["顯示站名"]
+        nearest_distance = f"{nearest['距離_公尺']:.0f} 公尺"
+        nearest_bikes = f"{int(nearest['目前可借車輛數'])} 輛"
+
+    cols = st.columns(4)
+    cols[0].metric("查詢站點可借車輛", f"{reference_available} 輛")
+    cols[1].metric("最近可借替代站", nearest_name)
+    cols[2].metric("距離", nearest_distance)
+    cols[3].metric("替代站可借車輛", nearest_bikes)
+
+    if not alternatives.empty:
+        nearest = alternatives.iloc[0]
+        st.info(
+            f"距離 **{selected_name}** 最近且有車可借的是 **{nearest['顯示站名']}**，"
+            f"直線距離約 **{nearest['距離_公尺']:.0f} 公尺**，"
+            f"當時有 **{int(nearest['目前可借車輛數'])} 輛**可借。"
+        )
+
+    reference_map = pd.DataFrame([reference]).copy()
+    reference_map["地圖標示"] = "查詢站點"
+    map_df = alternatives.copy()
+    map_df["地圖標示"] = "其他可借站"
+    if not map_df.empty:
+        map_df.loc[map_df.index[0], "地圖標示"] = "最近替代站"
+    map_df = pd.concat([reference_map, map_df], ignore_index=True)
+    map_df["地圖點大小"] = map_df["目前可借車輛數"].clip(lower=1) + 4
+    fig = px.scatter_map(
+        map_df,
+        lat="緯度",
+        lon="經度",
+        color="地圖標示",
+        size="地圖點大小",
+        hover_name="顯示站名",
+        hover_data={
+            "目前可借車輛數": True,
+            "目前可還空位數": True,
+            "距離_公尺": ":.0f",
+            "中文地址": True,
+            "地圖點大小": False,
+            "緯度": False,
+            "經度": False,
+        },
+        color_discrete_map={
+            "查詢站點": "#E76F51",
+            "最近替代站": "#1976D2",
+            "其他可借站": "#16A085",
+        },
+        zoom=15,
+        height=600,
+    )
+    fig.update_layout(map_style="open-street-map", margin=dict(l=0, r=0, t=0, b=0))
+    st.plotly_chart(fig, width="stretch")
+
+    if not alternatives.empty:
+        st.subheader("500 公尺內可借車的替代站")
+        table = alternatives[
+            ["顯示站名", "距離_公尺", "目前可借車輛數", "一般車可借數", "電輔車可借數", "中文地址"]
+        ].copy()
+        table["距離_公尺"] = table["距離_公尺"].round().astype(int)
+        table = table.rename(columns={"顯示站名": "替代站"})
+        st.dataframe(
+            table,
+            width="stretch",
+            hide_index=True,
+            column_config={
+                "距離_公尺": st.column_config.NumberColumn("距離", format="%d 公尺"),
+                "目前可借車輛數": st.column_config.NumberColumn("可借車輛", format="%d 輛"),
+                "一般車可借數": st.column_config.NumberColumn("一般車", format="%d 輛"),
+                "電輔車可借數": st.column_config.NumberColumn("電輔車", format="%d 輛"),
+            },
+        )
+
+
 def page_raw(df: pd.DataFrame) -> None:
     st.title("🔎 原始資料查詢")
     st.write("依目前側邊欄條件顯示資料；為避免瀏覽器卡頓，畫面最多顯示 5,000 筆。")
@@ -357,7 +497,10 @@ df = load_data()
 st.sidebar.title("🚲 專案導覽")
 page = st.sidebar.radio(
     "選擇頁面",
-    ["🏠 首頁", "📊 YouBike 整體", "🌧 天氣與雨量", "📍 站點與區域", "🔎 原始資料查詢"],
+    [
+        "🏠 首頁", "📊 YouBike 整體", "🌧 天氣與雨量", "📍 站點與區域",
+        "🧭 周邊替代站", "🔎 原始資料查詢",
+    ],
 )
 st.sidebar.divider()
 all_districts = sorted(df["場站所屬行政區"].unique())
@@ -381,5 +524,7 @@ elif page == "🌧 天氣與雨量":
     page_weather(filtered)
 elif page == "📍 站點與區域":
     page_station(filtered)
+elif page == "🧭 周邊替代站":
+    page_nearby(df)
 else:
     page_raw(filtered)

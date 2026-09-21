@@ -158,40 +158,131 @@ def page_overview(df: pd.DataFrame) -> None:
 
 def page_weather(df: pd.DataFrame) -> None:
     st.title("🌧 天氣與雨量")
-    weather_df = df.dropna(subset=["每小時雨量_mm"]).copy()
-    rainy = weather_df["每小時雨量_mm"].gt(0)
-    cols = st.columns(4)
-    cols[0].metric("有雨觀測比例", percent(rainy.mean()))
-    cols[1].metric("無雨平均可借率", percent(weather_df.loc[~rainy, "可借率"].mean()))
-    cols[2].metric("有雨平均可借率", percent(weather_df.loc[rainy, "可借率"].mean()))
-    cols[3].metric("最大逐時雨量", f"{weather_df['每小時雨量_mm'].max():.1f} mm")
+    st.write(
+        "這一頁比較下雨時的站點車輛，與該站在**相同小時、相同日型態（平日／週末）**"
+        "沒有下雨時的平常水準。這樣不會把早晚尖峰本來就有的差異誤認為雨天影響。"
+    )
 
-    comparison = (
-        weather_df.groupby("雨量狀態", as_index=False, observed=True)
-        .agg(觀測筆數=("場站代號", "size"), 平均可借率=("可借率", "mean"),
-             缺車率=("缺車", "mean"), 缺空位率=("缺空位", "mean"))
+    weather_df = df.dropna(subset=["每小時雨量_mm"]).copy()
+    weather_df = weather_df[weather_df["場站營運狀態"].eq(1)].copy()
+    weather_df["日型態"] = weather_df["抓取時間"].dt.dayofweek.lt(5).map(
+        {True: "平日", False: "週末"}
     )
-    order = ["無雨", "微雨", "小雨", "中大雨"]
-    comparison["雨量狀態"] = pd.Categorical(comparison["雨量狀態"], order, ordered=True)
-    comparison = comparison.sort_values("雨量狀態")
-    long = comparison.melt(
-        id_vars="雨量狀態", value_vars=["平均可借率", "缺車率", "缺空位率"],
-        var_name="指標", value_name="比例",
+
+    dry = weather_df[weather_df["每小時雨量_mm"].le(0)]
+    baseline = (
+        dry.groupby(["場站代號", "小時", "日型態"], as_index=False, observed=True)
+        .agg(
+            平常可借車輛=("目前可借車輛數", "median"),
+            平常可借率=("可借率", "median"),
+            無雨樣本數=("場站代號", "size"),
+        )
     )
-    fig = px.bar(long, x="雨量狀態", y="比例", color="指標", barmode="group", text_auto=".1%",
-                 title="不同雨量狀態下的供需指標")
-    fig.update_yaxes(tickformat=".0%")
-    st.plotly_chart(fig, width="stretch")
+    rainy_compare = weather_df[weather_df["每小時雨量_mm"].gt(0)].merge(
+        baseline, on=["場站代號", "小時", "日型態"], how="left"
+    )
+    rainy_compare = rainy_compare[rainy_compare["無雨樣本數"].ge(3)].copy()
+
+    if rainy_compare.empty:
+        st.warning("目前篩選條件沒有足夠的雨天與無雨資料可以比較，請擴大日期或行政區範圍。")
+        return
+
+    rainy_compare["比平常多出的車輛"] = (
+        rainy_compare["目前可借車輛數"] - rainy_compare["平常可借車輛"]
+    )
+    rainy_compare["可借率差"] = rainy_compare["可借率"] - rainy_compare["平常可借率"]
+
+    extra_bikes = rainy_compare["比平常多出的車輛"].mean()
+    availability_diff = rainy_compare["可借率差"].mean()
+    more_bikes_share = rainy_compare["比平常多出的車輛"].gt(0).mean()
+
+    cols = st.columns(4)
+    cols[0].metric("可比較的雨天觀測", f"{len(rainy_compare):,} 筆")
+    cols[1].metric("下雨時平均多出的車", f"{extra_bikes:+.2f} 輛／站")
+    cols[2].metric("可借率相對平常", f"{availability_diff * 100:+.1f} 個百分點")
+    cols[3].metric("車輛比平常多的比例", percent(more_bikes_share))
+
+    if extra_bikes > 0:
+        st.success(
+            f"在目前篩選範圍內，下雨時每個站平均比平常同時段多 {extra_bikes:.2f} 輛車。"
+            "這個結果符合『雨天可能較少人騎走 YouBike』的現象。"
+        )
+    elif extra_bikes < 0:
+        st.info(
+            f"在目前篩選範圍內，下雨時每個站平均比平常同時段少 {abs(extra_bikes):.2f} 輛車，"
+            "沒有出現雨天車輛較容易留在站內的現象。"
+        )
+    else:
+        st.info("下雨時的站點車輛數與平常同時段大致相同。")
 
     by_hour = (
-        weather_df.assign(是否下雨=rainy.map({True: "有雨", False: "無雨"}))
-        .groupby(["小時", "是否下雨"], as_index=False, observed=True)["可借率"].mean()
+        rainy_compare.groupby("小時", as_index=False, observed=True)
+        .agg(比平常多出的車輛=("比平常多出的車輛", "mean"), 雨天觀測數=("場站代號", "size"))
     )
-    fig = px.line(by_hour, x="小時", y="可借率", color="是否下雨", markers=True,
-                  title="有雨／無雨時的逐時平均可借率")
-    fig.update_yaxes(tickformat=".0%")
+    fig = px.bar(
+        by_hour,
+        x="小時",
+        y="比平常多出的車輛",
+        color="比平常多出的車輛",
+        color_continuous_scale=["#E76F51", "#F7FBFA", "#16A085"],
+        color_continuous_midpoint=0,
+        title="下雨時，各時段比平常多／少幾輛車",
+        hover_data=["雨天觀測數"],
+    )
+    fig.add_hline(y=0, line_color="#555", line_dash="dash")
+    fig.update_layout(coloraxis_colorbar_title="車輛差")
     st.plotly_chart(fig, width="stretch")
-    st.caption("這裡顯示關聯而非因果；通勤日、節假日及調度也可能同時影響結果。")
+    st.caption("正數＝下雨時站內車輛比平常多；負數＝下雨時站內車輛比平常少。")
+
+    district = (
+        rainy_compare.groupby("場站所屬行政區", as_index=False, observed=True)
+        .agg(
+            平均車輛差=("比平常多出的車輛", "mean"),
+            雨天觀測數=("場站代號", "size"),
+            車輛較多比例=("比平常多出的車輛", lambda values: values.gt(0).mean()),
+        )
+    )
+    district = district[district["雨天觀測數"].ge(30)].sort_values("平均車輛差")
+    fig = px.bar(
+        district,
+        x="平均車輛差",
+        y="場站所屬行政區",
+        orientation="h",
+        color="平均車輛差",
+        color_continuous_scale=["#E76F51", "#F7FBFA", "#16A085"],
+        color_continuous_midpoint=0,
+        title="各行政區：下雨時比平常多／少幾輛車",
+        hover_data={"雨天觀測數": True, "車輛較多比例": ":.1%"},
+    )
+    st.plotly_chart(fig, width="stretch")
+
+    rain_level = (
+        rainy_compare.groupby("雨量狀態", as_index=False, observed=True)
+        .agg(
+            平均車輛差=("比平常多出的車輛", "mean"),
+            平均可借率差=("可借率差", "mean"),
+            觀測筆數=("場站代號", "size"),
+        )
+    )
+    order = ["微雨", "小雨", "中大雨"]
+    rain_level["雨量狀態"] = pd.Categorical(rain_level["雨量狀態"], order, ordered=True)
+    rain_level = rain_level.sort_values("雨量狀態")
+    st.subheader("不同雨量強度的比較")
+    st.dataframe(
+        rain_level,
+        width="stretch",
+        hide_index=True,
+        column_config={
+            "平均車輛差": st.column_config.NumberColumn(format="%+.2f 輛"),
+            "平均可借率差": st.column_config.NumberColumn(format="%+.2f"),
+            "觀測筆數": st.column_config.NumberColumn(format="%d 筆"),
+        },
+    )
+
+    st.warning(
+        "重要限制：資料是每小時快照，沒有每一筆租借與歸還紀錄。車輛比平常多可以支持"
+        "『可能較少人借車』的推測，但也可能受到還車、調度、停駛與其他因素影響，不能直接當成租借量。"
+    )
 
 
 def page_station(df: pd.DataFrame) -> None:

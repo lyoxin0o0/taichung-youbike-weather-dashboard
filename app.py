@@ -369,12 +369,16 @@ def page_nearby(df: pd.DataFrame) -> None:
     )
     snapshot["距離_公尺"] = 6_371_000 * 2 * np.arcsin(np.sqrt(haversine_value))
 
-    alternatives = snapshot[
+    nearby = snapshot[
         snapshot["場站代號"].ne(reference["場站代號"])
         & snapshot["距離_公尺"].gt(0)
         & snapshot["距離_公尺"].le(500)
-        & snapshot["場站營運狀態"].eq(1)
-        & snapshot["目前可借車輛數"].gt(0)
+    ].copy()
+    nearby = nearby.sort_values("距離_公尺")
+
+    alternatives = nearby[
+        nearby["場站營運狀態"].eq(1)
+        & nearby["目前可借車輛數"].gt(0)
     ].copy()
     alternatives = alternatives.sort_values(["距離_公尺", "目前可借車輛數"], ascending=[True, False])
 
@@ -411,13 +415,22 @@ def page_nearby(df: pd.DataFrame) -> None:
             f"當時有 **{int(nearest['目前可借車輛數'])} 輛**可借。"
         )
 
+    nearby["地圖標示"] = np.select(
+        [
+            nearby["場站營運狀態"].ne(1),
+            nearby["目前可借車輛數"].le(0),
+        ],
+        ["暫停營運", "目前無車"],
+        default="其他可借站",
+    )
+    if not alternatives.empty:
+        nearest_station_id = alternatives.iloc[0]["場站代號"]
+        nearby.loc[nearby["場站代號"].eq(nearest_station_id), "地圖標示"] = "最近替代站"
+
     reference_map = pd.DataFrame([reference]).copy()
+    reference_map["距離_公尺"] = 0.0
     reference_map["地圖標示"] = "查詢站點"
-    map_df = alternatives.copy()
-    map_df["地圖標示"] = "其他可借站"
-    if not map_df.empty:
-        map_df.loc[map_df.index[0], "地圖標示"] = "最近替代站"
-    map_df = pd.concat([reference_map, map_df], ignore_index=True)
+    map_df = pd.concat([reference_map, nearby], ignore_index=True)
     map_df["地圖點大小"] = map_df["目前可借車輛數"].clip(lower=1) + 4
     fig = px.scatter_map(
         map_df,
@@ -439,6 +452,8 @@ def page_nearby(df: pd.DataFrame) -> None:
             "查詢站點": "#E76F51",
             "最近替代站": "#1976D2",
             "其他可借站": "#16A085",
+            "目前無車": "#9E9E9E",
+            "暫停營運": "#424242",
         },
         zoom=15,
         height=600,
@@ -446,13 +461,32 @@ def page_nearby(df: pd.DataFrame) -> None:
     fig.update_layout(map_style="open-street-map", margin=dict(l=0, r=0, t=0, b=0))
     st.plotly_chart(fig, width="stretch")
 
-    if not alternatives.empty:
-        st.subheader("500 公尺內可借車的替代站")
-        table = alternatives[
-            ["顯示站名", "距離_公尺", "目前可借車輛數", "一般車可借數", "電輔車可借數", "中文地址"]
+    if not nearby.empty:
+        st.subheader("500 公尺內所有鄰近站點")
+        st.caption("灰色的站點不是漏掉，而是該時間點沒有車可借；系統會繼續尋找下一個可借站。")
+        table = nearby[
+            [
+                "顯示站名", "地圖標示", "距離_公尺", "目前可借車輛數",
+                "一般車可借數", "電輔車可借數", "中文地址",
+            ]
         ].copy()
         table["距離_公尺"] = table["距離_公尺"].round().astype(int)
-        table = table.rename(columns={"顯示站名": "替代站"})
+        table["判定說明"] = np.select(
+            [
+                table["地圖標示"].eq("最近替代站"),
+                table["地圖標示"].eq("其他可借站"),
+                table["地圖標示"].eq("目前無車"),
+                table["地圖標示"].eq("暫停營運"),
+            ],
+            [
+                "最近且有車，推薦前往",
+                "有車，可作為替代站",
+                "目前 0 輛，因此略過",
+                "暫停營運，因此略過",
+            ],
+            default="",
+        )
+        table = table.drop(columns=["地圖標示"]).rename(columns={"顯示站名": "鄰近站點"})
         st.dataframe(
             table,
             width="stretch",

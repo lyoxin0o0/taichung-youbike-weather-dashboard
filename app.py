@@ -24,6 +24,27 @@ STATUS_COLORS = {
     "缺空位風險": "#E76F51", "暫停營運": "#7F8C8D",
 }
 
+# 依行政院人事行政總處公布的 2026 年政府行政機關辦公日曆表。
+# 週六、週日會另外由程式自動判定，這裡只列平日放假的日期。
+NATIONAL_HOLIDAYS_2026 = {
+    pd.Timestamp("2026-01-01").date(): "元旦",
+    pd.Timestamp("2026-02-16").date(): "農曆春節",
+    pd.Timestamp("2026-02-17").date(): "農曆春節",
+    pd.Timestamp("2026-02-18").date(): "農曆春節",
+    pd.Timestamp("2026-02-19").date(): "農曆春節",
+    pd.Timestamp("2026-02-20").date(): "農曆春節",
+    pd.Timestamp("2026-02-27").date(): "和平紀念日補假",
+    pd.Timestamp("2026-04-03").date(): "兒童節補假",
+    pd.Timestamp("2026-04-06").date(): "清明節補假",
+    pd.Timestamp("2026-05-01").date(): "勞動節",
+    pd.Timestamp("2026-06-19").date(): "端午節",
+    pd.Timestamp("2026-09-25").date(): "中秋節",
+    pd.Timestamp("2026-09-28").date(): "教師節",
+    pd.Timestamp("2026-10-09").date(): "國慶日補假",
+    pd.Timestamp("2026-10-26").date(): "臺灣光復暨金門古寧頭大捷紀念日補假",
+    pd.Timestamp("2026-12-25").date(): "行憲紀念日",
+}
+
 
 @st.cache_data(show_spinner="載入分析資料中…")
 def load_data() -> pd.DataFrame:
@@ -327,6 +348,200 @@ def page_station(df: pd.DataFrame) -> None:
     st.plotly_chart(fig, width="stretch")
 
 
+def page_day_type(df: pd.DataFrame) -> None:
+    st.title("🚲 通勤型與休閒型分析")
+    st.write(
+        "比較**平日（通勤型）**與**假日（休閒型）**各時段的車輛流動。"
+        "假日包含週六、週日及 2026 年政府行政機關辦公日曆表所列國定假日與補假。"
+    )
+
+    flow = df.sort_values(["場站代號", "抓取時間"]).copy()
+    grouped = flow.groupby("場站代號", observed=True)
+    flow["前次時間"] = grouped["抓取時間"].shift()
+    flow["前次車輛"] = grouped["目前可借車輛數"].shift()
+    flow["間隔分鐘"] = (flow["抓取時間"] - flow["前次時間"]).dt.total_seconds() / 60
+    flow["車輛淨變動"] = flow["目前可借車輛數"] - flow["前次車輛"]
+    flow["推估流動量"] = flow["車輛淨變動"].abs()
+    flow["日期"] = flow["抓取時間"].dt.date
+    flow["國定假日名稱"] = flow["日期"].map(NATIONAL_HOLIDAYS_2026)
+    flow["是否國定假日"] = flow["國定假日名稱"].notna()
+    flow["是否週末"] = flow["抓取時間"].dt.dayofweek.ge(5)
+    flow["日型態"] = np.where(
+        flow["是否週末"] | flow["是否國定假日"],
+        "假日（休閒型）",
+        "平日（通勤型）",
+    )
+
+    # 只比較約一小時的連續快照，避免把漏抓數小時後的差異算成單一時段流動。
+    flow = flow[
+        flow["場站營運狀態"].eq(1)
+        & flow["間隔分鐘"].between(30, 90)
+        & flow["推估流動量"].notna()
+    ].copy()
+    if flow.empty or flow["日型態"].nunique() < 2:
+        st.warning("目前篩選範圍不足以同時比較平日與假日，請擴大日期範圍。")
+        return
+
+    day_summary = (
+        flow.groupby(["日期", "日型態"], as_index=False, observed=True)
+        .agg(每日推估流動量=("推估流動量", "sum"), 有效站時數=("推估流動量", "size"))
+    )
+    summary = (
+        flow.groupby("日型態", as_index=False, observed=True)
+        .agg(
+            每站每小時平均流動=("推估流動量", "mean"),
+            有效站時數=("推估流動量", "size"),
+        )
+        .merge(
+            day_summary.groupby("日型態", as_index=False, observed=True).agg(
+                平均每日流動=("每日推估流動量", "mean"),
+                天數=("日期", "nunique"),
+            ),
+            on="日型態",
+        )
+        .set_index("日型態")
+    )
+    weekday_flow = summary.loc["平日（通勤型）", "每站每小時平均流動"]
+    holiday_flow = summary.loc["假日（休閒型）", "每站每小時平均流動"]
+    difference = holiday_flow / weekday_flow - 1 if weekday_flow else np.nan
+    national_dates = flow.loc[flow["是否國定假日"], "日期"].nunique()
+
+    cols = st.columns(5)
+    cols[0].metric("平日天數", f"{summary.loc['平日（通勤型）', '天數']:.0f} 天")
+    cols[1].metric("假日天數", f"{summary.loc['假日（休閒型）', '天數']:.0f} 天")
+    cols[2].metric("其中國定假日", f"{national_dates} 天")
+    cols[3].metric("平日每站每小時流動", f"{weekday_flow:.2f} 輛")
+    cols[4].metric(
+        "假日每站每小時流動",
+        f"{holiday_flow:.2f} 輛",
+        delta=f"較平日 {difference:+.1%}" if pd.notna(difference) else None,
+    )
+
+    if national_dates == 0:
+        st.info(
+            "目前所選日期沒有涵蓋國定假日，因此這次的假日結果來自週六、週日；"
+            "未來資料涵蓋國定假日時，程式會自動把它歸入假日。"
+        )
+
+    hourly = (
+        flow.groupby(["日型態", "小時"], as_index=False, observed=True)
+        .agg(
+            每站平均流動=("推估流動量", "mean"),
+            平均淨變動=("車輛淨變動", "mean"),
+            有效站時數=("推估流動量", "size"),
+        )
+    )
+    fig = px.line(
+        hourly,
+        x="小時",
+        y="每站平均流動",
+        color="日型態",
+        markers=True,
+        hover_data={"有效站時數": True, "平均淨變動": ":+.2f"},
+        color_discrete_map={"平日（通勤型）": "#2E7D32", "假日（休閒型）": "#F39C12"},
+        title="平日與假日：各時段每站平均車輛流動",
+    )
+    fig.add_vrect(x0=7, x1=9, fillcolor="#2E7D32", opacity=0.08, line_width=0)
+    fig.add_vrect(x0=17, x1=19, fillcolor="#2E7D32", opacity=0.08, line_width=0)
+    fig.update_layout(hovermode="x unified", yaxis_title="推估流動量（輛／站時）")
+    st.plotly_chart(fig, width="stretch")
+    st.caption("綠色淡區為通勤尖峰 07–09 時與 17–19 時；線越高代表該時段站內車輛變動越大。")
+
+    periods = pd.cut(
+        flow["小時"],
+        bins=[-1, 6, 9, 15, 19, 23],
+        labels=["深夜清晨", "早通勤", "日間", "晚通勤", "夜間"],
+    )
+    period_flow = (
+        flow.assign(時段=periods)
+        .groupby(["時段", "日型態"], as_index=False, observed=True)
+        .agg(每站平均流動=("推估流動量", "mean"))
+    )
+    fig = px.bar(
+        period_flow,
+        x="時段",
+        y="每站平均流動",
+        color="日型態",
+        barmode="group",
+        color_discrete_map={"平日（通勤型）": "#2E7D32", "假日（休閒型）": "#F39C12"},
+        title="不同時段的平日／假日流動差異",
+        text_auto=".2f",
+    )
+    st.plotly_chart(fig, width="stretch")
+
+    station_type = (
+        flow.groupby(
+            ["場站代號", "場站中文名稱", "場站所屬行政區", "日型態"],
+            as_index=False,
+            observed=True,
+        )
+        .agg(每站平均流動=("推估流動量", "mean"), 樣本數=("推估流動量", "size"))
+    )
+    station_pivot = station_type.pivot(
+        index=["場站代號", "場站中文名稱", "場站所屬行政區"],
+        columns="日型態",
+        values=["每站平均流動", "樣本數"],
+    ).reset_index()
+    station_pivot.columns = [
+        "場站代號", "場站中文名稱", "場站所屬行政區",
+        "假日平均流動", "平日平均流動", "假日樣本數", "平日樣本數",
+    ]
+    station_pivot = station_pivot.dropna().copy()
+    station_pivot = station_pivot[
+        station_pivot["假日樣本數"].ge(12) & station_pivot["平日樣本數"].ge(12)
+    ]
+    station_pivot["假日減平日"] = station_pivot["假日平均流動"] - station_pivot["平日平均流動"]
+    threshold = 0.10
+    station_pivot["站點型態"] = np.select(
+        [
+            station_pivot["平日平均流動"] > station_pivot["假日平均流動"] * (1 + threshold),
+            station_pivot["假日平均流動"] > station_pivot["平日平均流動"] * (1 + threshold),
+        ],
+        ["通勤型", "休閒型"],
+        default="混合型",
+    )
+
+    st.subheader("哪些站比較像通勤型或休閒型？")
+    st.caption("平日或假日平均流動量高出另一類至少 10% 才分類；差距較小列為混合型。")
+    type_counts = station_pivot["站點型態"].value_counts()
+    type_cols = st.columns(3)
+    for column, label in zip(type_cols, ["通勤型", "休閒型", "混合型"]):
+        column.metric(label, f"{type_counts.get(label, 0):,} 站")
+
+    left, right = st.columns(2)
+    with left:
+        commute = station_pivot.sort_values("假日減平日").head(15)
+        fig = px.bar(
+            commute,
+            x="假日減平日",
+            y="場站中文名稱",
+            orientation="h",
+            color_discrete_sequence=["#2E7D32"],
+            title="平日流動較高：通勤特徵最明顯的站",
+            hover_data=["場站所屬行政區", "平日平均流動", "假日平均流動"],
+        )
+        fig.update_layout(yaxis={"categoryorder": "total descending"})
+        st.plotly_chart(fig, width="stretch")
+    with right:
+        leisure = station_pivot.sort_values("假日減平日", ascending=False).head(15)
+        fig = px.bar(
+            leisure,
+            x="假日減平日",
+            y="場站中文名稱",
+            orientation="h",
+            color_discrete_sequence=["#F39C12"],
+            title="假日流動較高：休閒特徵最明顯的站",
+            hover_data=["場站所屬行政區", "平日平均流動", "假日平均流動"],
+        )
+        fig.update_layout(yaxis={"categoryorder": "total ascending"})
+        st.plotly_chart(fig, width="stretch")
+
+    st.warning(
+        "判讀限制：這裡的『流動量』是相鄰約一小時快照中，可借車輛數變化的絕對值。"
+        "同一小時內的借還可能互相抵消，站務調度也會造成變化，因此它適合比較型態，"
+        "但不是官方精確租借筆數。"
+    )
+
 def page_nearby(df: pd.DataFrame) -> None:
     st.title("🧭 周邊替代站")
     st.write(
@@ -533,7 +748,7 @@ page = st.sidebar.radio(
     "選擇頁面",
     [
         "🏠 首頁", "📊 YouBike 整體", "🌧 天氣與雨量", "📍 站點與區域",
-        "🧭 周邊替代站", "🔎 原始資料查詢",
+        "🚲 通勤型與休閒型", "🧭 周邊替代站", "🔎 原始資料查詢",
     ],
 )
 st.sidebar.divider()
@@ -558,6 +773,8 @@ elif page == "🌧 天氣與雨量":
     page_weather(filtered)
 elif page == "📍 站點與區域":
     page_station(filtered)
+elif page == "🚲 通勤型與休閒型":
+    page_day_type(filtered)
 elif page == "🧭 周邊替代站":
     page_nearby(df)
 else:
